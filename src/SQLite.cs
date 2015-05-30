@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2009-2014 Krueger Systems, Inc.
+// Copyright (c) 2009-2015 Krueger Systems, Inc.
 // 
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -33,7 +33,12 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 #endif
 using System.Collections.Generic;
-using System.Collections.Concurrent;
+#if NO_CONCURRENT
+using ConcurrentStringDictionary = System.Collections.Generic.Dictionary<string, object>;
+using SQLite.Extensions;
+#else
+using ConcurrentStringDictionary = System.Collections.Concurrent.ConcurrentDictionary<string, object>;
+#endif
 using System.Reflection;
 using System.Linq;
 using System.Linq.Expressions;
@@ -123,12 +128,13 @@ namespace SQLite
     [Flags]
     public enum CreateFlags
     {
-        None = 0,
-        ImplicitPK = 1,    // create a primary key for field called 'Id' (Orm.ImplicitPkName)
-        ImplicitIndex = 2, // create an index for fields ending in 'Id' (Orm.ImplicitIndexSuffix)
-        AllImplicit = 3,   // do both above
-
-        AutoIncPK = 4      // force PK field to be auto inc
+        None                = 0x000,
+        ImplicitPK          = 0x001,    // create a primary key for field called 'Id' (Orm.ImplicitPkName)
+        ImplicitIndex       = 0x002,    // create an index for fields ending in 'Id' (Orm.ImplicitIndexSuffix)
+        AllImplicit         = 0x003,    // do both above
+        AutoIncPK           = 0x004,    // force PK field to be auto inc
+        FullTextSearch3     = 0x100,    // create virtual table using FTS3
+        FullTextSearch4     = 0x200     // create virtual table using FTS4
     }
 
 	/// <summary>
@@ -165,11 +171,13 @@ namespace SQLite
 		/// </param>
 		/// <param name="storeDateTimeAsTicks">
 		/// Specifies whether to store DateTime properties as ticks (true) or strings (false). You
-		/// absolutely do want to store them as Ticks in all new projects. The default of false is
+		/// absolutely do want to store them as Ticks in all new projects. The value of false is
 		/// only here for backwards compatibility. There is a *significant* speed advantage, with no
 		/// down sides, when setting storeDateTimeAsTicks = true.
+		/// If you use DateTimeOffset properties, it will be always stored as ticks regardingless
+		/// the storeDateTimeAsTicks parameter.
 		/// </param>
-		public SQLiteConnection (string databasePath, bool storeDateTimeAsTicks = false)
+		public SQLiteConnection (string databasePath, bool storeDateTimeAsTicks = true)
 			: this (databasePath, SQLiteOpenFlags.ReadWrite | SQLiteOpenFlags.Create, storeDateTimeAsTicks)
 		{
 		}
@@ -182,11 +190,13 @@ namespace SQLite
 		/// </param>
 		/// <param name="storeDateTimeAsTicks">
 		/// Specifies whether to store DateTime properties as ticks (true) or strings (false). You
-		/// absolutely do want to store them as Ticks in all new projects. The default of false is
+		/// absolutely do want to store them as Ticks in all new projects. The value of false is
 		/// only here for backwards compatibility. There is a *significant* speed advantage, with no
 		/// down sides, when setting storeDateTimeAsTicks = true.
+		/// If you use DateTimeOffset properties, it will be always stored as ticks regardingless
+		/// the storeDateTimeAsTicks parameter.
 		/// </param>
-		public SQLiteConnection (string databasePath, SQLiteOpenFlags openFlags, bool storeDateTimeAsTicks = false)
+		public SQLiteConnection (string databasePath, SQLiteOpenFlags openFlags, bool storeDateTimeAsTicks = true)
 		{
 			if (string.IsNullOrEmpty (databasePath))
 				throw new ArgumentException ("Must be specified", "databasePath");
@@ -380,8 +390,16 @@ namespace SQLite
 				map = GetMapping (ty, createFlags);
 				_tables.Add (ty.FullName, map);
 			}
-			var query = "create table if not exists \"" + map.TableName + "\"(\n";
-			
+
+            // Facilitate virtual tables a.k.a. full-text search.
+		    bool fts3 = (createFlags & CreateFlags.FullTextSearch3) != 0;
+		    bool fts4 = (createFlags & CreateFlags.FullTextSearch4) != 0;
+		    bool fts = fts3 || fts4;
+            var @virtual = fts ? "virtual " : string.Empty;
+		    var @using = fts3 ? "using fts3 " : fts4 ? "using fts4 " : string.Empty;
+
+            // Build query.
+			var query = "create " + @virtual + "table if not exists \"" + map.TableName + "\" " + @using + "(\n";
 			var decls = map.Columns.Select (p => Orm.SqlDecl (p, StoreDateTimeAsTicks));
 			var decl = string.Join (",\n", decls.ToArray ());
 			query += decl;
@@ -1084,18 +1102,27 @@ namespace SQLite
 		/// </summary>
 		/// <param name="objects">
 		/// An <see cref="IEnumerable"/> of the objects to insert.
+		/// <param name="runInTransaction"/>
+		/// A boolean indicating if the inserts should be wrapped in a transaction.
 		/// </param>
 		/// <returns>
 		/// The number of rows added to the table.
 		/// </returns>
-		public int InsertAll (System.Collections.IEnumerable objects)
+		public int InsertAll (System.Collections.IEnumerable objects, bool runInTransaction=true)
 		{
 			var c = 0;
-			RunInTransaction(() => {
+			if (runInTransaction) {
+				RunInTransaction(() => {
+					foreach (var r in objects) {
+						c += Insert (r);
+					}
+				});
+			}
+			else {
 				foreach (var r in objects) {
 					c += Insert (r);
 				}
-			});
+			}
 			return c;
 		}
 
@@ -1108,17 +1135,27 @@ namespace SQLite
 		/// <param name="extra">
 		/// Literal SQL code that gets placed into the command. INSERT {extra} INTO ...
 		/// </param>
+		/// <param name="runInTransaction"/>
+		/// A boolean indicating if the inserts should be wrapped in a transaction.
+		/// </param>
 		/// <returns>
 		/// The number of rows added to the table.
 		/// </returns>
-		public int InsertAll (System.Collections.IEnumerable objects, string extra)
+		public int InsertAll (System.Collections.IEnumerable objects, string extra, bool runInTransaction=true)
 		{
 			var c = 0;
-			RunInTransaction (() => {
+			if (runInTransaction) {
+				RunInTransaction (() => {
+					foreach (var r in objects) {
+						c += Insert (r, extra);
+					}
+				});
+			}
+			else {
 				foreach (var r in objects) {
-					c += Insert (r, extra);
+					c+= Insert (r);
 				}
-			});
+			}
 			return c;
 		}
 
@@ -1131,17 +1168,27 @@ namespace SQLite
 		/// <param name="objType">
 		/// The type of object to insert.
 		/// </param>
+		/// <param name="runInTransaction"/>
+		/// A boolean indicating if the inserts should be wrapped in a transaction.
+		/// </param>
 		/// <returns>
 		/// The number of rows added to the table.
 		/// </returns>
-		public int InsertAll (System.Collections.IEnumerable objects, Type objType)
+		public int InsertAll (System.Collections.IEnumerable objects, Type objType, bool runInTransaction=true)
 		{
 			var c = 0;
-			RunInTransaction (() => {
+			if (runInTransaction) {
+				RunInTransaction (() => {
+					foreach (var r in objects) {
+						c += Insert (r, objType);
+					}
+				});
+			}
+			else {
 				foreach (var r in objects) {
 					c += Insert (r, objType);
 				}
-			});
+			}
 			return c;
 		}
 		
@@ -1418,17 +1465,27 @@ namespace SQLite
 		/// <param name="objects">
 		/// An <see cref="IEnumerable"/> of the objects to insert.
 		/// </param>
+		/// <param name="runInTransaction"/>
+		/// A boolean indicating if the inserts should be wrapped in a transaction
+		/// </param>
 		/// <returns>
 		/// The number of rows modified.
 		/// </returns>
-		public int UpdateAll (System.Collections.IEnumerable objects)
+		public int UpdateAll (System.Collections.IEnumerable objects, bool runInTransaction=true)
 		{
 			var c = 0;
-			RunInTransaction (() => {
+			if (runInTransaction) {
+				RunInTransaction (() => {
+					foreach (var r in objects) {
+						c += Update (r);
+					}
+				});
+			}
+			else {
 				foreach (var r in objects) {
 					c += Update (r);
 				}
-			});
+			}
 			return c;
 		}
 
@@ -1752,7 +1809,7 @@ namespace SQLite
 				// People should not be calling Get/Find without a PK
 				GetByPrimaryKeySql = string.Format ("select * from \"{0}\" limit 1", TableName);
 			}
-			_insertCommandMap = new ConcurrentDictionary<string, PreparedSqlLiteInsertCommand> ();
+			_insertCommandMap = new ConcurrentStringDictionary ();
 		}
 
 		public bool HasAutoIncPK { get; private set; }
@@ -1793,21 +1850,23 @@ namespace SQLite
 			var exact = Columns.FirstOrDefault (c => c.Name == columnName);
 			return exact;
 		}
-		
-		ConcurrentDictionary<string, PreparedSqlLiteInsertCommand> _insertCommandMap;
+
+        ConcurrentStringDictionary _insertCommandMap;
 
 		public PreparedSqlLiteInsertCommand GetInsertCommand(SQLiteConnection conn, string extra)
 		{
-			PreparedSqlLiteInsertCommand prepCmd;
-			if (!_insertCommandMap.TryGetValue (extra, out prepCmd)) {
-				prepCmd = CreateInsertCommand (conn, extra);
+			object prepCmdO;
+            
+			if (!_insertCommandMap.TryGetValue (extra, out prepCmdO)) {
+				var prepCmd = CreateInsertCommand (conn, extra);
+				prepCmdO = prepCmd;
 				if (!_insertCommandMap.TryAdd (extra, prepCmd)) {
 					// Concurrent add attempt beat us.
 					prepCmd.Dispose ();
-					_insertCommandMap.TryGetValue (extra, out prepCmd);
+					_insertCommandMap.TryGetValue (extra, out prepCmdO);
 				}
 			}
-			return prepCmd;
+			return (PreparedSqlLiteInsertCommand)prepCmdO;
 		}
 		
 		PreparedSqlLiteInsertCommand CreateInsertCommand(SQLiteConnection conn, string extra)
@@ -1842,7 +1901,7 @@ namespace SQLite
 		protected internal void Dispose()
 		{
 			foreach (var pair in _insertCommandMap) {
-				pair.Value.Dispose ();
+                ((PreparedSqlLiteInsertCommand)pair.Value).Dispose ();
 			}
 			_insertCommandMap = null;
 		}
@@ -1942,10 +2001,9 @@ namespace SQLite
 		public static string SqlType (TableMapping.Column p, bool storeDateTimeAsTicks)
 		{
 			var clrType = p.ColumnType;
-			if (clrType == typeof(Boolean) || clrType == typeof(Byte) || clrType == typeof(UInt16) || clrType == typeof(SByte) || clrType == typeof(Int16) || clrType == typeof(Int32)) {
+            if (clrType == typeof(Boolean) || clrType == typeof(Byte) || clrType == typeof(UInt16) || clrType == typeof(SByte) || clrType == typeof(Int16) || clrType == typeof(Int32) || clrType == typeof(UInt32) || clrType == typeof(Int64))
+            {
 				return "integer";
-			} else if (clrType == typeof(UInt32) || clrType == typeof(Int64)) {
-				return "bigint";
 			} else if (clrType == typeof(Single) || clrType == typeof(Double) || clrType == typeof(Decimal)) {
 				return "float";
 			} else if (clrType == typeof(String)) {
@@ -2505,6 +2563,24 @@ namespace SQLite
 			}
 		}
 
+		public int Delete(Expression<Func<T, bool>> predExpr)
+		{
+			if (predExpr.NodeType == ExpressionType.Lambda) {
+				var lambda = (LambdaExpression)predExpr;
+				var pred = lambda.Body;
+				var args = new List<object> ();
+				var w = CompileExpr (pred, args);
+				var cmdText = "delete from \"" + Table.TableName + "\"";
+				cmdText += " where " + w.CommandText;
+				var command = Connection.CreateCommand (cmdText, args.ToArray ());
+
+				int result = command.ExecuteNonQuery();
+				return result;
+			} else {
+				throw new NotSupportedException ("Must be a predicate");
+			}
+		}
+
 		public TableQuery<T> Take (int n)
 		{
 			var q = Clone<T> ();
@@ -2672,7 +2748,18 @@ namespace SQLite
 				else
 					text = "(" + leftr.CommandText + " " + GetSqlName(bin) + " " + rightr.CommandText + ")";
 				return new CompileResult { CommandText = text };
-			} else if (expr.NodeType == ExpressionType.Call) {
+			} else if (expr.NodeType == ExpressionType.Not) {
+                var operandExpr = ((UnaryExpression)expr).Operand;
+                var opr = CompileExpr(operandExpr, queryArgs);
+                object val = opr.Value;
+                if (val is bool)
+                    val = !((bool) val);
+                return new CompileResult
+                {
+                    CommandText = "NOT(" + opr.CommandText + ")",
+                    Value = val
+                };
+            } else if (expr.NodeType == ExpressionType.Call) {
 				
 				var call = (MethodCallExpression)expr;
 				var args = new CompileResult[call.Arguments.Count];
@@ -3364,3 +3451,24 @@ namespace SQLite
 		}
 	}
 }
+
+#if NO_CONCURRENT
+namespace SQLite.Extensions
+{
+    public static class ListEx
+    {
+        public static bool TryAdd<TKey, TValue> (this IDictionary<TKey, TValue> dict, TKey key, TValue value)
+        {
+            try {
+                dict.Add (key, value);
+                return true;
+            }
+            catch (ArgumentException) {
+                return false;
+            }
+        }
+    }
+}
+#endif
+
+
